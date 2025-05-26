@@ -1,153 +1,112 @@
-pipeline{
-    agent any
-    tools{
-        jdk 'jdk17'
-        nodejs 'node16'
+
+pipeline {
+    agent any 
+    tools {
+        jdk 'jdk'
+        nodejs 'nodejs'
     }
-    environment {
+    environment  {
         SCANNER_HOME=tool 'sonar-scanner'
+        AWS_ACCOUNT_ID = credentials('ACCOUNT_ID')
+        AWS_ECR_REPO_NAME = credentials('ECR_REPO2')
+        AWS_DEFAULT_REGION = 'us-east-1'
+        REPOSITORY_URI = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com/"
     }
     stages {
-        stage('clean workspace'){
-            steps{
+        stage('Cleaning Workspace') {
+            steps {
                 cleanWs()
             }
         }
-      
-        stage('Checkout from Git'){
-            steps{
-                git branch: 'main', url: 'https://github.com/dummy-roro/Tetris-V2.git'
-            }
-        }
-      
-        stage('Installing Dependencies') {
-            options { timestamps() }
+        stage('Checkout from Git') {
             steps {
-                sh 'npm install --no-audit'
+                git credentialsId: 'GITHUB', url: 'https://github.com/AmanPathak-DevOps/End-to-End-Kubernetes-Three-Tier-DevSecOps-Project.git'
             }
         }
-
-        stage('Dependency Scanning') {
-            parallel {
-                stage('NPM Dependency Audit') {
-                    steps {
+        stage('Sonarqube Analysis') {
+            steps {
+                dir('Application-Code/backend') {
+                    withSonarQubeEnv('sonar-server') {
+                        sh ''' $SCANNER_HOME/bin/sonar-scanner \
+                        -Dsonar.projectName=three-tier-backend \
+                        -Dsonar.projectKey=three-tier-backend '''
+                    }
+                }
+            }
+        }
+        stage('Quality Check') {
+            steps {
+                script {
+                    waitForQualityGate abortPipeline: false, credentialsId: 'sonar-token' 
+                }
+            }
+        }
+        stage('OWASP Dependency-Check Scan') {
+            steps {
+                dir('Application-Code/backend') {
+                    dependencyCheck additionalArguments: '--scan ./ --disableYarnAudit --disableNodeAudit', odcInstallation: 'DP-Check'
+                    dependencyCheckPublisher pattern: '**/dependency-check-report.xml'
+                }
+            }
+        }
+        stage('Trivy File Scan') {
+            steps {
+                dir('Application-Code/backend') {
+                    sh 'trivy fs . > trivyfs.txt'
+                }
+            }
+        }
+        stage("Docker Image Build") {
+            steps {
+                script {
+                    dir('Application-Code/backend') {
+                            sh 'docker system prune -f'
+                            sh 'docker container prune -f'
+                            sh 'docker build -t ${AWS_ECR_REPO_NAME} .'
+                    }
+                }
+            }
+        }
+        stage("ECR Image Pushing") {
+            steps {
+                script {
+                        sh 'aws ecr get-login-password --region ${AWS_DEFAULT_REGION} | docker login --username AWS --password-stdin ${REPOSITORY_URI}'
+                        sh 'docker tag ${AWS_ECR_REPO_NAME} ${REPOSITORY_URI}${AWS_ECR_REPO_NAME}:${BUILD_NUMBER}'
+                        sh 'docker push ${REPOSITORY_URI}${AWS_ECR_REPO_NAME}:${BUILD_NUMBER}'
+                }
+            }
+        }
+        stage("TRIVY Image Scan") {
+            steps {
+                sh 'trivy image ${REPOSITORY_URI}${AWS_ECR_REPO_NAME}:${BUILD_NUMBER} > trivyimage.txt' 
+            }
+        }
+        stage('Checkout Code') {
+            steps {
+                git credentialsId: 'GITHUB', url: 'https://github.com/AmanPathak-DevOps/End-to-End-Kubernetes-Three-Tier-DevSecOps-Project.git'
+            }
+        }
+        stage('Update Deployment file') {
+            environment {
+                GIT_REPO_NAME = "End-to-End-Kubernetes-Three-Tier-DevSecOps-Project"
+                GIT_USER_NAME = "AmanPathak-DevOps"
+            }
+            steps {
+                dir('Kubernetes-Manifests-file/Backend') {
+                    withCredentials([string(credentialsId: 'github', variable: 'GITHUB_TOKEN')]) {
                         sh '''
-                            npm audit --audit-level=critical
-                            echo $?
+                            git config user.email "aman07pathak@gmail.com"
+                            git config user.name "AmanPathak-DevOps"
+                            BUILD_NUMBER=${BUILD_NUMBER}
+                            echo $BUILD_NUMBER
+                            imageTag=$(grep -oP '(?<=backend:)[^ ]+' deployment.yaml)
+                            echo $imageTag
+                            sed -i "s/${AWS_ECR_REPO_NAME}:${imageTag}/${AWS_ECR_REPO_NAME}:${BUILD_NUMBER}/" deployment.yaml
+                            git add deployment.yaml
+                            git commit -m "Update deployment Image to version \${BUILD_NUMBER}"
+                            git push https://${GITHUB_TOKEN}@github.com/${GIT_USER_NAME}/${GIT_REPO_NAME} HEAD:master
                         '''
                     }
-                }
-
-                stage('OWASP Dependency Check') {
-                    steps {
-                        dependencyCheck additionalArguments: '''
-                            --scan \'./\' 
-                            --out \'./\'  
-                            --format \'ALL\' 
-                            --disableYarnAudit \
-                            --prettyPrint''', odcInstallation: 'OWASP-DepCheck-10'
-
-                        dependencyCheckPublisher failedTotalCritical: 1, pattern: 'dependency-check-report.xml', stopBuild: false
-                    }
-                }
-            }
-        }
-      
-        stage('Unit Testing') {
-            options { retry(2) }
-            steps {
-                sh 'npm test' 
-            }
-        }    
-
-        stage('Code Coverage') {
-            steps {
-                catchError(buildResult: 'SUCCESS', message: 'Oops! it will be fixed in future releases', stageResult: 'UNSTABLE') {
-                    sh 'npm run coverage'
-                }
-            }
-        }
-        
-        stage("Sonarqube Analysis "){
-            steps{
-                withSonarQubeEnv('sonar-server') {
-                    sh ''' $SCANNER_HOME/bin/sonar-scanner -Dsonar.projectName=TetrisVersion2.0 \
-                    -Dsonar.projectKey=TetrisVersion2.0 '''
-                }
-            }
-        }
-        stage("quality gate"){
-           steps {
-                script {
-                    waitForQualityGate abortPipeline: false, credentialsId: 'Sonar-cred'
-                }
-            }
-        }
-        
-        stage('OWASP FS SCAN') {
-            steps {
-                dependencyCheck additionalArguments: '--scan ./ --disableYarnAudit --disableNodeAudit', odcInstallation: 'DP-Check'
-                dependencyCheckPublisher pattern: '**/dependency-check-report.xml'
-            }
-        }
-        stage('TRIVY FS SCAN') {
-            steps {
-                sh "trivy fs . > trivyfs.txt"
-            }
-        }
-        stage("Docker Build"){
-            steps{
-                script{
-                   withDockerRegistry(credentialsId: 'docker', toolName: 'docker'){
-                       sh  'docker build -t dummyroro/tetris:$GIT_COMMIT .'
-                    }
-                }
-            }
-        }
-      
-        stage('Trivy Vulnerability Scanner') {
-            steps {
-                sh  ''' 
-                    trivy image dummyroro/tetris:$GIT_COMMIT \
-                        --severity LOW,MEDIUM,HIGH \
-                        --exit-code 0 \
-                        --quiet \
-                        --format json -o trivy-image-MEDIUM-results.json
-
-                    trivy image dummyroro/tetris:$GIT_COMMIT \
-                        --severity CRITICAL \
-                        --exit-code 1 \
-                        --quiet \
-                        --format json -o trivy-image-CRITICAL-results.json
-                '''
-            }
-            post {
-                always {
-                    sh '''
-                        trivy convert \
-                            --format template --template "@/usr/local/share/trivy/templates/html.tpl" \
-                            --output trivy-image-MEDIUM-results.html trivy-image-MEDIUM-results.json 
-
-                        trivy convert \
-                            --format template --template "@/usr/local/share/trivy/templates/html.tpl" \
-                            --output trivy-image-CRITICAL-results.html trivy-image-CRITICAL-results.json
-
-                        trivy convert \
-                            --format template --template "@/usr/local/share/trivy/templates/junit.tpl" \
-                            --output trivy-image-MEDIUM-results.xml  trivy-image-MEDIUM-results.json 
-
-                        trivy convert \
-                            --format template --template "@/usr/local/share/trivy/templates/junit.tpl" \
-                            --output trivy-image-CRITICAL-results.xml trivy-image-CRITICAL-results.json          
-                    '''
-                }
-            }
-        } 
-
-        stage('Push Docker Image') {
-            steps {
-                withDockerRegistry(credentialsId: 'docker', url: "") {
-                    sh  'docker push dummyroro/tetris:$GIT_COMMIT'
                 }
             }
         }
